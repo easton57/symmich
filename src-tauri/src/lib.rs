@@ -9,7 +9,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "tiff", "svg",
@@ -47,6 +48,10 @@ fn delete_password_from_keyring(email: &str) {
     }
 }
 
+fn default_close_behavior() -> String {
+    "hide".to_string()
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings {
     server_url: String,
@@ -55,6 +60,8 @@ struct Settings {
     local_folder: String,
     album_id: Option<String>,
     scan_frequency_minutes: u64,
+    #[serde(default = "default_close_behavior")]
+    close_behavior: String,
 }
 
 impl Default for Settings {
@@ -66,6 +73,7 @@ impl Default for Settings {
             local_folder: String::new(),
             album_id: None,
             scan_frequency_minutes: 30,
+            close_behavior: default_close_behavior(),
         }
     }
 }
@@ -76,7 +84,18 @@ impl Settings {
         fs::read_to_string(path)
             .ok()
             .and_then(|contents| serde_json::from_str(&contents).ok())
-            .unwrap_or_default()
+            .unwrap_or_else(|| Self::first_run_default(app))
+    }
+
+    /// Used when there's no settings file yet (first launch). Defaults the
+    /// sync folder to the user's Pictures directory so there's a sensible
+    /// starting point instead of an empty field.
+    fn first_run_default(app: &AppHandle) -> Self {
+        let mut settings = Self::default();
+        if let Ok(dir) = app.path().picture_dir() {
+            settings.local_folder = dir.to_string_lossy().to_string();
+        }
+        settings
     }
 
     fn save(&self, app: &AppHandle) -> Result<(), String> {
@@ -170,10 +189,6 @@ impl Manifest {
     fn contains_asset(&self, asset_id: &str) -> bool {
         self.assets.iter().any(|a| a.asset_id == asset_id)
     }
-
-    fn contains_file(&self, file_name: &str) -> bool {
-        self.assets.iter().any(|a| a.file_name == file_name)
-    }
 }
 
 struct ScanSnapshot {
@@ -191,6 +206,7 @@ struct Session {
     album_id: Option<String>,
     local_folder: String,
     scan_frequency_minutes: u64,
+    close_behavior: String,
     scan_running: bool,
     last_scan: Option<String>,
     last_scan_count: usize,
@@ -209,6 +225,7 @@ impl Default for Session {
             album_id: None,
             local_folder: String::new(),
             scan_frequency_minutes: 30,
+            close_behavior: default_close_behavior(),
             scan_running: false,
             last_scan: None,
             last_scan_count: 0,
@@ -231,6 +248,7 @@ impl Session {
             album_id: settings.album_id,
             local_folder: settings.local_folder,
             scan_frequency_minutes: settings.scan_frequency_minutes,
+            close_behavior: settings.close_behavior,
             scan_running: false,
             last_scan: None,
             last_scan_count: 0,
@@ -252,6 +270,7 @@ fn settings_from_session(session: &Session) -> Settings {
         local_folder: session.local_folder.clone(),
         album_id: session.album_id.clone(),
         scan_frequency_minutes: session.scan_frequency_minutes,
+        close_behavior: session.close_behavior.clone(),
     }
 }
 
@@ -304,6 +323,7 @@ fn save_settings(
     session.local_folder = settings.local_folder.clone();
     session.album_id = settings.album_id.clone();
     session.scan_frequency_minutes = settings.scan_frequency_minutes;
+    session.close_behavior = settings.close_behavior.clone();
     settings.save(&app)
 }
 
@@ -537,32 +557,6 @@ fn is_image_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn scan_images(folder: &str) -> Result<Vec<String>, String> {
-    let manifest = Manifest::load(folder);
-    let mut images = Vec::new();
-    let entries = fs::read_dir(folder).map_err(|e| e.to_string())?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if manifest.contains_file(file_name) {
-            continue;
-        }
-        if is_image_path(&path) {
-            if let Some(p) = path.to_str() {
-                images.push(p.to_string());
-            }
-        }
-    }
-
-    images.sort();
-    Ok(images)
-}
-
 fn scan_all_images(folder: &str) -> Result<Vec<String>, String> {
     let mut images = Vec::new();
     let entries = fs::read_dir(folder).map_err(|e| e.to_string())?;
@@ -582,9 +576,20 @@ fn scan_all_images(folder: &str) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn find_images(state: State<'_, Mutex<Session>>) -> Result<Vec<String>, String> {
-    let folder = state.lock().map_err(|e| e.to_string())?.local_folder.clone();
-    scan_images(&folder)
+async fn find_images(app: AppHandle) -> Result<Vec<String>, String> {
+    let (album_id, folder) = {
+        let state = app.state::<Mutex<Session>>();
+        let session = state.lock().map_err(|e| e.to_string())?;
+        (session.album_id.clone(), session.local_folder.clone())
+    };
+    if folder.trim().is_empty() {
+        return Err("No local folder set. Add one in Settings.".to_string());
+    }
+
+    match album_id {
+        Some(id) if !id.is_empty() => images_pending_upload(&app, &id, &folder).await,
+        _ => scan_all_images(&folder),
+    }
 }
 
 fn file_sha1_hex(path: &str) -> Result<String, String> {
@@ -598,6 +603,51 @@ fn asset_checksum_hex(asset: &serde_json::Value) -> Option<String> {
     let checksum = asset.get("checksum").and_then(|c| c.as_str())?;
     let bytes = BASE64.decode(checksum.as_bytes()).ok()?;
     Some(hex::encode(bytes))
+}
+
+async fn fetch_album_assets(
+    app: &AppHandle,
+    album_id: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (status, parsed) = api_json_request(
+        app,
+        reqwest::Method::GET,
+        &format!("/api/albums/{}", album_id),
+        None,
+    )
+    .await?;
+    if !status.is_success() {
+        return Err(format!("Fetching album failed with status {}: {}", status, parsed));
+    }
+
+    Ok(parsed
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Local files whose content checksum doesn't match any asset already in the
+/// remote album. Using the server's checksums (rather than a local manifest of
+/// "files we remember uploading") means files uploaded before this function
+/// existed, or from another machine, are correctly recognized as already
+/// synced instead of being re-uploaded as duplicates.
+async fn images_pending_upload(
+    app: &AppHandle,
+    album_id: &str,
+    folder: &str,
+) -> Result<Vec<String>, String> {
+    let assets = fetch_album_assets(app, album_id).await?;
+    let remote_checksums: std::collections::HashSet<String> =
+        assets.iter().filter_map(asset_checksum_hex).collect();
+
+    let mut pending = Vec::new();
+    for file in scan_all_images(folder)? {
+        if !remote_checksums.contains(&file_sha1_hex(&file)?) {
+            pending.push(file);
+        }
+    }
+    Ok(pending)
 }
 
 // ---------- Albums ----------
@@ -693,7 +743,13 @@ async fn find_album_by_name(
 
 // ---------- Upload ----------
 
-fn asset_metadata(path: &str) -> Result<(String, String), String> {
+fn system_time_to_rfc3339(time: std::time::SystemTime) -> Option<String> {
+    let d = time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+        .map(|dt| dt.to_rfc3339())
+}
+
+fn asset_metadata(path: &str) -> Result<(String, String, String), String> {
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
     let file_name = Path::new(path)
         .file_name()
@@ -701,30 +757,29 @@ fn asset_metadata(path: &str) -> Result<(String, String), String> {
         .unwrap_or("image")
         .to_string();
 
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok());
+    let modified = meta.modified().ok();
+    let modified_secs = modified
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
-    let created_at = modified
-        .and_then(|d| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
-        })
-        .map(|dt| dt.to_rfc3339())
+    let modified_at = modified
+        .and_then(system_time_to_rfc3339)
         .unwrap_or_default();
+    // Not all filesystems expose birth time; fall back to mtime for fileCreatedAt.
+    let created_at = meta
+        .created()
+        .ok()
+        .and_then(system_time_to_rfc3339)
+        .unwrap_or_else(|| modified_at.clone());
 
-    let device_asset_id = format!(
-        "{}-{}-{}",
-        file_name,
-        meta.len(),
-        modified.map(|d| d.as_secs()).unwrap_or(0)
-    );
+    let device_asset_id = format!("{}-{}-{}", file_name, meta.len(), modified_secs);
 
-    Ok((created_at, device_asset_id))
+    Ok((created_at, modified_at, device_asset_id))
 }
 
 async fn upload_asset_form(image_path: &str) -> Result<reqwest::multipart::Form, String> {
-    let (created_at, device_asset_id) = asset_metadata(image_path)?;
+    let (created_at, modified_at, device_asset_id) = asset_metadata(image_path)?;
     let part = reqwest::multipart::Part::file(image_path)
         .await
         .map_err(|e| e.to_string())?;
@@ -733,7 +788,8 @@ async fn upload_asset_form(image_path: &str) -> Result<reqwest::multipart::Form,
         .text("deviceAssetId", device_asset_id)
         .text("deviceId", "symmich-desktop")
         .text("assetType", "IMAGE")
-        .text("fileCreatedAt", created_at))
+        .text("fileCreatedAt", created_at)
+        .text("fileModifiedAt", modified_at))
 }
 
 async fn upload_asset(app: &AppHandle, image_path: &str) -> Result<reqwest::Response, String> {
@@ -874,22 +930,7 @@ async fn pull_album(app: AppHandle) -> Result<PullResult, String> {
     }
     fs::create_dir_all(&local_folder).map_err(|e| e.to_string())?;
 
-    let (status, parsed) = api_json_request(
-        &app,
-        reqwest::Method::GET,
-        &format!("/api/albums/{}", album_id),
-        None,
-    )
-    .await?;
-    if !status.is_success() {
-        return Err(format!("Fetching album failed with status {}: {}", status, parsed));
-    }
-
-    let assets = parsed
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let assets = fetch_album_assets(&app, &album_id).await?;
 
     let mut manifest = Manifest::load(&local_folder);
     let mut downloaded = 0;
@@ -945,22 +986,7 @@ async fn sync_diff(app: AppHandle) -> Result<SyncDiff, String> {
         return Err("No local folder set. Add one in Settings.".to_string());
     }
 
-    let (status, parsed) = api_json_request(
-        &app,
-        reqwest::Method::GET,
-        &format!("/api/albums/{}", album_id),
-        None,
-    )
-    .await?;
-    if !status.is_success() {
-        return Err(format!("Fetching album failed with status {}: {}", status, parsed));
-    }
-
-    let assets = parsed
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let assets = fetch_album_assets(&app, &album_id).await?;
 
     let mut remote_by_checksum: HashMap<String, &serde_json::Value> = HashMap::new();
     let mut remote_name_to_checksum: HashMap<String, String> = HashMap::new();
@@ -1051,22 +1077,7 @@ async fn resolve_conflict(
     };
     let album_id = album_id.ok_or_else(|| "No album selected. Create or find an album first.".to_string())?;
 
-    let (status, parsed) = api_json_request(
-        &app,
-        reqwest::Method::GET,
-        &format!("/api/albums/{}", album_id),
-        None,
-    )
-    .await?;
-    if !status.is_success() {
-        return Err(format!("Fetching album failed with status {}: {}", status, parsed));
-    }
-
-    let assets = parsed
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let assets = fetch_album_assets(&app, &album_id).await?;
 
     let asset = assets
         .iter()
@@ -1185,7 +1196,7 @@ async fn run_scan_impl(app: &AppHandle) -> Result<ScanResult, String> {
             }
         };
 
-        let images = scan_images(&snapshot.local_folder)?;
+        let images = images_pending_upload(app, &album_id, &snapshot.local_folder).await?;
         let total = images.len();
         let mut uploaded = 0;
 
@@ -1312,6 +1323,22 @@ async fn auto_scan_loop(app: AppHandle) {
 
 // ---------- Tray icon ----------
 
+/// GTK's native tray/menu widgets don't reliably follow the desktop's dark-mode
+/// preference on their own (a known Tauri/muda issue on Linux, seen as a light
+/// background with light — effectively invisible — text). Explicitly syncing
+/// GTK's own dark-theme setting to whatever theme Tauri detected for the main
+/// window keeps the tray menu's colors internally consistent.
+#[cfg(target_os = "linux")]
+fn sync_gtk_theme(is_dark: bool) {
+    use gtk::prelude::GtkSettingsExt;
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(is_dark);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_gtk_theme(_is_dark: bool) {}
+
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(app, "show", "Show Symmich", true, None::<&str>)?;
     let scan = MenuItem::with_id(app, "scan", "Scan now", true, None::<&str>)?;
@@ -1374,8 +1401,49 @@ pub fn run() {
             let session = Session::load(app.handle());
             app.manage(Mutex::new(session));
 
+            let prefers_dark = app
+                .get_webview_window("main")
+                .and_then(|w| w.theme().ok())
+                .map(|theme| matches!(theme, tauri::Theme::Dark))
+                .unwrap_or(false);
+            sync_gtk_theme(prefers_dark);
+
             if let Err(e) = setup_tray(app) {
                 tracing::error!("failed to create tray icon: {}", e);
+            }
+
+            if let Some(window) = app.get_webview_window("main") {
+                let app_handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+
+                        let close_behavior = {
+                            let state = app_handle.state::<Mutex<Session>>();
+                            state
+                                .lock()
+                                .map(|s| s.close_behavior.clone())
+                                .unwrap_or_else(|_| default_close_behavior())
+                        };
+
+                        if close_behavior == "quit_confirm" {
+                            let exit_handle = app_handle.clone();
+                            app_handle
+                                .dialog()
+                                .message("Are you sure you want to quit Symmich?")
+                                .title("Quit Symmich")
+                                .kind(MessageDialogKind::Warning)
+                                .buttons(MessageDialogButtons::OkCancel)
+                                .show(move |confirmed| {
+                                    if confirmed {
+                                        exit_handle.exit(0);
+                                    }
+                                });
+                        } else if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                    }
+                });
             }
 
             let app_handle = app.handle().clone();
