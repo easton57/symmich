@@ -1021,10 +1021,10 @@ async fn download_asset(app: &AppHandle, asset_id: &str) -> Result<Vec<u8>, Stri
 
 #[tauri::command]
 async fn pull_album(app: AppHandle) -> Result<PullResult, String> {
-    let (album_id, local_folder) = {
+    let (album_id, local_folder, depth) = {
         let state = app.state::<Mutex<Session>>();
         let session = state.lock().map_err(|e| e.to_string())?;
-        (session.album_id.clone(), session.local_folder.clone())
+        (session.album_id.clone(), session.local_folder.clone(), session.scan_depth)
     };
 
     let album_id = album_id.ok_or_else(|| "No album selected. Create or find an album first.".to_string())?;
@@ -1035,6 +1035,13 @@ async fn pull_album(app: AppHandle) -> Result<PullResult, String> {
 
     let assets = fetch_album_assets(&app, &album_id).await?;
 
+    // Anything already on disk (e.g. files this app uploaded, possibly in
+    // subfolders) is matched by content so it isn't downloaded a second time.
+    let mut local_checksums = std::collections::HashSet::new();
+    for file in scan_all_images(&local_folder, depth)? {
+        local_checksums.insert(file_sha1_hex(&file)?);
+    }
+
     let mut manifest = Manifest::load(&local_folder);
     let mut downloaded = 0;
     let mut skipped = 0;
@@ -1042,14 +1049,33 @@ async fn pull_album(app: AppHandle) -> Result<PullResult, String> {
 
     for asset in &assets {
         let asset_id = asset.get("id").and_then(|i| i.as_str()).unwrap_or("");
-        if asset_id.is_empty() || manifest.contains_asset(asset_id) {
+        let checksum = asset_checksum_hex(asset);
+        let present = checksum.as_ref().is_some_and(|c| local_checksums.contains(c));
+        if asset_id.is_empty() || manifest.contains_asset(asset_id) || present {
             skipped += 1;
             continue;
         }
 
-        let file_name = format!("{}{}", asset_id, ext_from_asset(asset));
+        let original_name = asset
+            .get("originalFileName")
+            .and_then(|n| n.as_str())
+            .and_then(|n| Path::new(n).file_name())
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string());
+        let file_name = original_name.unwrap_or_else(|| format!("{}{}", asset_id, ext_from_asset(asset)));
+        let target = Path::new(&local_folder).join(&file_name);
+        // A different file with the same name is a conflict; leave it for
+        // conflict resolution rather than overwriting it.
+        if target.exists() {
+            skipped += 1;
+            continue;
+        }
+
         let bytes = download_asset(&app, asset_id).await?;
-        fs::write(Path::new(&local_folder).join(&file_name), bytes).map_err(|e| e.to_string())?;
+        fs::write(&target, bytes).map_err(|e| e.to_string())?;
+        if let Some(c) = checksum {
+            local_checksums.insert(c);
+        }
 
         manifest.assets.push(PulledAsset {
             asset_id: asset_id.to_string(),

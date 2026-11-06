@@ -305,7 +305,7 @@ function App() {
     try {
       const result = await invoke<PullResult>("pull_album");
       notice(
-        `Pull complete: ${result.downloaded} downloaded, ${result.skipped} already present`,
+        `Pull complete: ${result.downloaded} downloaded, ${result.skipped} skipped (already local or name conflict)`,
       );
       refreshActivity();
     } catch (err) {
