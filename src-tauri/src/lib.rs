@@ -639,26 +639,71 @@ fn asset_checksum_hex(asset: &serde_json::Value) -> Option<String> {
     Some(hex::encode(bytes))
 }
 
+/// All assets in an album. Immich 3.4 dropped the `assets` array from the album
+/// response (only `assetCount` remains), so assets are paged through the
+/// metadata search instead, falling back to the album response for servers
+/// that predate album filtering in search.
 async fn fetch_album_assets(
     app: &AppHandle,
     album_id: &str,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let (status, parsed) = api_json_request(
-        app,
-        reqwest::Method::GET,
-        &format!("/api/albums/{}", album_id),
-        None,
-    )
-    .await?;
-    if !status.is_success() {
-        return Err(format!("Fetching album failed with status {}: {}", status, parsed));
+    match search_album_assets(app, album_id).await {
+        Ok(assets) => Ok(assets),
+        Err(search_err) => {
+            let (status, parsed) = api_json_request(
+                app,
+                reqwest::Method::GET,
+                &format!("/api/albums/{}", album_id),
+                None,
+            )
+            .await?;
+            if !status.is_success() {
+                return Err(format!("Fetching album failed with status {}: {}", status, parsed));
+            }
+            match parsed.get("assets").and_then(|a| a.as_array()) {
+                Some(assets) => Ok(assets.clone()),
+                None => Err(search_err),
+            }
+        }
+    }
+}
+
+async fn search_album_assets(
+    app: &AppHandle,
+    album_id: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut assets = Vec::new();
+    let mut page: u64 = 1;
+
+    loop {
+        // `albumIds`/`page` are deprecated in 3.2+ in favour of `filter`/`cursor`,
+        // but still accepted, and they also work on older servers.
+        let body = serde_json::json!({ "albumIds": [album_id], "page": page, "size": 1000 });
+        let (status, parsed) =
+            api_json_request(app, reqwest::Method::POST, "/api/search/metadata", Some(body)).await?;
+        if !status.is_success() {
+            return Err(format!("Searching album assets failed with status {}: {}", status, parsed));
+        }
+
+        let result = parsed
+            .get("assets")
+            .ok_or_else(|| "Unexpected search response".to_string())?;
+        if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
+            assets.extend(items.iter().cloned());
+        }
+
+        let next = result.get("nextPage").and_then(|n| match n {
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            serde_json::Value::Number(n) => n.as_u64(),
+            _ => None,
+        });
+        match next {
+            Some(n) if n > page => page = n,
+            _ => break,
+        }
     }
 
-    Ok(parsed
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .cloned()
-        .unwrap_or_default())
+    Ok(assets)
 }
 
 /// Local files whose content checksum doesn't match any asset already in the
