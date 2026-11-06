@@ -40,5 +40,5 @@
 3. [x] **File scanner** — Walk directories, hash files, extract metadata
 4. [x] **Sync engine** — Compare local vs server state, build upload queue
 5. [x] **File watcher** — `notify` crate for real-time monitoring
-6. [x] **Tauri commands** — Expose sync status, progress, and controls to Next.js
+6. [x] **Tauri commands** — Expose sync status, progress, and controls to the React frontend
 7. [x] **Frontend UI** — Show sync progress, album selection, settings

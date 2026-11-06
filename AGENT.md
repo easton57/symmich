@@ -2,14 +2,14 @@
 
 ## Stack
 - **Backend:** Rust (Tauri)
-- **Frontend:** Next.js (TypeScript)
+- **Frontend:** React + Vite (TypeScript)
 - **Desktop:** Tauri v2
 
 ## Project Structure (Target)
 
 ```
 symmich/
-├── package.json            # Next.js frontend
+├── package.json            # React + Vite frontend
 ├── src/                    # React pages/components
 ├── public/
 ├── src-tauri/              # Rust backend

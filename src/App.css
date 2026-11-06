@@ -121,14 +121,7 @@ a:hover {
   flex-shrink: 0;
   width: 34px;
   height: 34px;
-  border-radius: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: linear-gradient(135deg, var(--primary), #7f5af0);
-  color: #ffffff;
-  font-weight: 700;
-  font-size: 1rem;
+  object-fit: contain;
 }
 
 .brand .subtitle {
@@ -258,10 +251,8 @@ a:hover {
 }
 
 .login-mark {
-  width: 44px;
-  height: 44px;
-  font-size: 1.3rem;
-  border-radius: 12px;
+  width: 64px;
+  height: 64px;
 }
 
 .login-card h1 {

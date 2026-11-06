@@ -16,17 +16,27 @@ Symmich is an unofficial desktop sync client for Immich.
 [Tray Icon](https://github.com/tauri-apps/tray-icon)  
 [Reqwest](https://docs.rs/reqwest/latest/reqwest/)
 
-## Psuedo code
+## Installing
 
-Functions:
-Pull file list
-Pull file
-Push file
-Compare files
-Authenticate
-Conflict list
-Last Modified Compare
+Installers for Windows, macOS and Linux (.deb, .rpm, AppImage) are built by
+GitHub Actions whenever a `v*.*.*` tag is pushed, and can be downloaded from
+that workflow run's artifacts.
 
-Tray
-UI
-Sync Status
+The macOS DMG is not signed or notarized, so Gatekeeper will warn on first
+launch. Right-click the app and choose **Open**, or run
+`xattr -dr com.apple.quarantine /Applications/Symmich.app`.
+
+## Development
+
+Requires Node.js 20+ and a Rust toolchain, plus the
+[Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for
+your platform.
+
+```bash
+npm install
+npm run tauri dev
+```
+
+## License
+
+[MIT](LICENSE)

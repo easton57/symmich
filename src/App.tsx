@@ -23,6 +23,8 @@ import {
 type CloseBehavior = "hide" | "quit_confirm";
 type Tab = "overview" | "activity" | "settings";
 
+const DEFAULT_ALBUM_NAME = "Symmich";
+
 interface SessionInfo {
   server_url: string;
   email: string;
@@ -35,6 +37,7 @@ interface Settings {
   local_folder: string;
   album_id?: string | null;
   scan_frequency_minutes: number;
+  scan_depth: number;
   close_behavior: CloseBehavior;
 }
 
@@ -98,6 +101,7 @@ function App() {
   const [localFolder, setLocalFolder] = useState("");
   const [albumId, setAlbumId] = useState("");
   const [scanFrequency, setScanFrequency] = useState("30");
+  const [scanDepth, setScanDepth] = useState("0");
   const [closeBehavior, setCloseBehavior] = useState<CloseBehavior>("hide");
   const [images, setImages] = useState<string[] | null>(null);
   const [message, setMessage] = useState("");
@@ -123,10 +127,12 @@ function App() {
       .then((s) => {
         setServerUrl(s.server_url);
         setEmail(s.email);
-        setAlbumName(s.album_name);
+        // Suggest a name for first-run setup; it's only saved once sign-in succeeds.
+        setAlbumName(s.album_name || (s.album_id ? "" : DEFAULT_ALBUM_NAME));
         setLocalFolder(s.local_folder);
         setAlbumId(s.album_id ?? "");
         setScanFrequency(String(s.scan_frequency_minutes ?? 0));
+        setScanDepth(String(s.scan_depth ?? 0));
         setCloseBehavior(s.close_behavior ?? "hide");
       })
       .catch(() => {});
@@ -192,8 +198,19 @@ function App() {
     try {
       await invoke("login", { url: serverUrl, email, password });
       setPassword("");
-      notice("Logged in");
       setLoggedIn(true);
+      if (!albumId) {
+        try {
+          const id = await invoke<string>("setup_album", { albumName });
+          setAlbumName(albumName.trim());
+          setAlbumId(id);
+          notice(`Logged in — syncing to album "${albumName.trim()}"`);
+        } catch (err) {
+          fail(`Logged in, but the album couldn't be set up: ${err}`);
+        }
+      } else {
+        notice("Logged in");
+      }
       refreshActivity();
     } catch (err) {
       fail(err);
@@ -220,6 +237,7 @@ function App() {
           local_folder: localFolder,
           album_id: albumId || null,
           scan_frequency_minutes: Number(scanFrequency) || 0,
+          scan_depth: Math.max(0, Math.floor(Number(scanDepth) || 0)),
           close_behavior: closeBehavior,
         },
       });
@@ -338,7 +356,7 @@ function App() {
       <div className="login-shell">
         <div className="login-card">
           <div className="login-brand">
-            <div className="login-mark">S</div>
+            <img className="login-mark" src="/symmich.png" alt="Symmich" />
           </div>
           <h1>Symmich</h1>
           <p className="subtitle">Sign in to your Immich server</p>
@@ -369,6 +387,17 @@ function App() {
                 type="password"
               />
             </div>
+            {!albumId && (
+              <div className="input-icon">
+                <ImageIcon size={16} />
+                <input
+                  value={albumName}
+                  onChange={(e) => setAlbumName(e.currentTarget.value)}
+                  placeholder="Album to sync to (created if missing)"
+                  required
+                />
+              </div>
+            )}
             <button type="submit" className="btn btn-primary btn-block">
               Login
             </button>
@@ -383,7 +412,7 @@ function App() {
     <div className="app-shell">
       <header className="app-header">
         <div className="brand">
-          <div className="brand-mark">S</div>
+          <img className="brand-mark" src="/symmich.png" alt="" />
           <div>
             <h1>Symmich</h1>
             <p className="subtitle">{serverUrl || "Immich desktop sync"}</p>
@@ -655,6 +684,16 @@ function App() {
                   onChange={(e) => setScanFrequency(e.currentTarget.value)}
                   type="number"
                   min={0}
+                />
+              </label>
+              <label className="field-label">
+                Subfolder depth (0 = selected folder only)
+                <input
+                  value={scanDepth}
+                  onChange={(e) => setScanDepth(e.currentTarget.value)}
+                  type="number"
+                  min={0}
+                  step={1}
                 />
               </label>
 

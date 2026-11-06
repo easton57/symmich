@@ -60,6 +60,9 @@ struct Settings {
     local_folder: String,
     album_id: Option<String>,
     scan_frequency_minutes: u64,
+    /// Subfolder levels below `local_folder` to include; 0 = that folder only.
+    #[serde(default)]
+    scan_depth: u32,
     #[serde(default = "default_close_behavior")]
     close_behavior: String,
 }
@@ -73,6 +76,7 @@ impl Default for Settings {
             local_folder: String::new(),
             album_id: None,
             scan_frequency_minutes: 30,
+            scan_depth: 0,
             close_behavior: default_close_behavior(),
         }
     }
@@ -195,6 +199,7 @@ struct ScanSnapshot {
     album_name: String,
     album_id: Option<String>,
     local_folder: String,
+    scan_depth: u32,
 }
 
 struct Session {
@@ -206,6 +211,7 @@ struct Session {
     album_id: Option<String>,
     local_folder: String,
     scan_frequency_minutes: u64,
+    scan_depth: u32,
     close_behavior: String,
     scan_running: bool,
     last_scan: Option<String>,
@@ -225,6 +231,7 @@ impl Default for Session {
             album_id: None,
             local_folder: String::new(),
             scan_frequency_minutes: 30,
+            scan_depth: 0,
             close_behavior: default_close_behavior(),
             scan_running: false,
             last_scan: None,
@@ -248,6 +255,7 @@ impl Session {
             album_id: settings.album_id,
             local_folder: settings.local_folder,
             scan_frequency_minutes: settings.scan_frequency_minutes,
+            scan_depth: settings.scan_depth,
             close_behavior: settings.close_behavior,
             scan_running: false,
             last_scan: None,
@@ -270,6 +278,7 @@ fn settings_from_session(session: &Session) -> Settings {
         local_folder: session.local_folder.clone(),
         album_id: session.album_id.clone(),
         scan_frequency_minutes: session.scan_frequency_minutes,
+        scan_depth: session.scan_depth,
         close_behavior: session.close_behavior.clone(),
     }
 }
@@ -323,6 +332,7 @@ fn save_settings(
     session.local_folder = settings.local_folder.clone();
     session.album_id = settings.album_id.clone();
     session.scan_frequency_minutes = settings.scan_frequency_minutes;
+    session.scan_depth = settings.scan_depth;
     session.close_behavior = settings.close_behavior.clone();
     settings.save(&app)
 }
@@ -557,38 +567,62 @@ fn is_image_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn scan_all_images(folder: &str) -> Result<Vec<String>, String> {
+/// Lists images in `folder` and up to `depth` levels of subfolders. Hidden
+/// folders and symlinked folders are skipped (the latter to avoid cycles).
+fn scan_all_images(folder: &str, depth: u32) -> Result<Vec<String>, String> {
     let mut images = Vec::new();
-    let entries = fs::read_dir(folder).map_err(|e| e.to_string())?;
+    collect_images(Path::new(folder), depth, &mut images)?;
+    images.sort();
+    Ok(images)
+}
+
+fn collect_images(dir: &Path, depth: u32, images: &mut Vec<String>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
 
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if path.is_file() && is_image_path(&path) {
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
+            let hidden = entry.file_name().to_string_lossy().starts_with('.');
+            if depth > 0 && !hidden {
+                collect_images(&path, depth - 1, images)?;
+            }
+        } else if path.is_file() && is_image_path(&path) {
             if let Some(p) = path.to_str() {
                 images.push(p.to_string());
             }
         }
     }
 
-    images.sort();
-    Ok(images)
+    Ok(())
+}
+
+/// Path of `file` relative to the sync folder, used to name files in the diff
+/// and conflict lists so nested files can be told apart and written back.
+fn relative_to(folder: &str, file: &str) -> String {
+    Path::new(file)
+        .strip_prefix(folder)
+        .ok()
+        .and_then(|p| p.to_str())
+        .unwrap_or(file)
+        .to_string()
 }
 
 #[tauri::command]
 async fn find_images(app: AppHandle) -> Result<Vec<String>, String> {
-    let (album_id, folder) = {
+    let (album_id, folder, depth) = {
         let state = app.state::<Mutex<Session>>();
         let session = state.lock().map_err(|e| e.to_string())?;
-        (session.album_id.clone(), session.local_folder.clone())
+        (session.album_id.clone(), session.local_folder.clone(), session.scan_depth)
     };
     if folder.trim().is_empty() {
         return Err("No local folder set. Add one in Settings.".to_string());
     }
 
     match album_id {
-        Some(id) if !id.is_empty() => images_pending_upload(&app, &id, &folder).await,
-        _ => scan_all_images(&folder),
+        Some(id) if !id.is_empty() => images_pending_upload(&app, &id, &folder, depth).await,
+        _ => scan_all_images(&folder, depth),
     }
 }
 
@@ -636,13 +670,14 @@ async fn images_pending_upload(
     app: &AppHandle,
     album_id: &str,
     folder: &str,
+    depth: u32,
 ) -> Result<Vec<String>, String> {
     let assets = fetch_album_assets(app, album_id).await?;
     let remote_checksums: std::collections::HashSet<String> =
         assets.iter().filter_map(asset_checksum_hex).collect();
 
     let mut pending = Vec::new();
-    for file in scan_all_images(folder)? {
+    for file in scan_all_images(folder, depth)? {
         if !remote_checksums.contains(&file_sha1_hex(&file)?) {
             pending.push(file);
         }
@@ -735,6 +770,29 @@ async fn find_album_by_name(
         .ok_or_else(|| format!("No album named '{}' found", album_name))?;
 
     let mut session = state.lock().map_err(|e| e.to_string())?;
+    session.album_id = Some(album_id.clone());
+    persist_settings(&session, &app)?;
+
+    Ok(album_id)
+}
+
+/// Sets the target album during first-run setup, reusing an existing album of
+/// that name or creating it, so a scan can start right after sign-in.
+#[tauri::command]
+async fn setup_album(
+    app: AppHandle,
+    state: State<'_, Mutex<Session>>,
+    album_name: String,
+) -> Result<String, String> {
+    let album_name = album_name.trim().to_string();
+    if album_name.is_empty() {
+        return Err("Album name is empty".to_string());
+    }
+
+    let album_id = resolve_album(&app, &album_name).await?;
+
+    let mut session = state.lock().map_err(|e| e.to_string())?;
+    session.album_name = album_name;
     session.album_id = Some(album_id.clone());
     persist_settings(&session, &app)?;
 
@@ -975,10 +1033,10 @@ async fn pull_album(app: AppHandle) -> Result<PullResult, String> {
 
 #[tauri::command]
 async fn sync_diff(app: AppHandle) -> Result<SyncDiff, String> {
-    let (album_id, local_folder) = {
+    let (album_id, local_folder, depth) = {
         let state = app.state::<Mutex<Session>>();
         let session = state.lock().map_err(|e| e.to_string())?;
-        (session.album_id.clone(), session.local_folder.clone())
+        (session.album_id.clone(), session.local_folder.clone(), session.scan_depth)
     };
 
     let album_id = album_id.ok_or_else(|| "No album selected. Create or find an album first.".to_string())?;
@@ -1001,7 +1059,7 @@ async fn sync_diff(app: AppHandle) -> Result<SyncDiff, String> {
         }
     }
 
-    let local_files = scan_all_images(&local_folder)?;
+    let local_files = scan_all_images(&local_folder, depth)?;
     let mut synced = Vec::new();
     let mut local_only = Vec::new();
     let mut conflicts = Vec::new();
@@ -1009,6 +1067,7 @@ async fn sync_diff(app: AppHandle) -> Result<SyncDiff, String> {
 
     for file in &local_files {
         let local_checksum = file_sha1_hex(file)?;
+        let rel_path = relative_to(&local_folder, file);
         let file_name = Path::new(file)
             .file_name()
             .and_then(|n| n.to_str())
@@ -1017,14 +1076,14 @@ async fn sync_diff(app: AppHandle) -> Result<SyncDiff, String> {
 
         if remote_by_checksum.contains_key(&local_checksum) {
             matched_remote.insert(local_checksum);
-            synced.push(file_name);
+            synced.push(rel_path);
             continue;
         }
 
         if let Some(remote_checksum) = remote_name_to_checksum.get(&file_name) {
             if *remote_checksum != local_checksum {
                 conflicts.push(Conflict {
-                    file: file_name,
+                    file: rel_path,
                     local_checksum,
                     remote_checksum: remote_checksum.clone(),
                 });
@@ -1032,7 +1091,7 @@ async fn sync_diff(app: AppHandle) -> Result<SyncDiff, String> {
             }
         }
 
-        local_only.push(file_name);
+        local_only.push(rel_path);
     }
 
     let mut remote_only = Vec::new();
@@ -1079,15 +1138,27 @@ async fn resolve_conflict(
 
     let assets = fetch_album_assets(&app, &album_id).await?;
 
+    // `file` is relative to the sync folder; remote assets are matched by base name.
+    if Path::new(&file)
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!("Invalid file path '{}'", file));
+    }
+    let base_name = Path::new(&file)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(&file)
+        .to_string();
     let asset = assets
         .iter()
         .find(|a| {
             a.get("originalFileName")
                 .and_then(|n| n.as_str())
-                .map(|n| Path::new(n).file_name().and_then(|f| f.to_str()).unwrap_or(n) == file)
+                .map(|n| Path::new(n).file_name().and_then(|f| f.to_str()).unwrap_or(n) == base_name)
                 .unwrap_or(false)
         })
-        .ok_or_else(|| format!("No remote asset named '{}' found", file))?;
+        .ok_or_else(|| format!("No remote asset named '{}' found", base_name))?;
 
     let asset_id = asset
         .get("id")
@@ -1158,6 +1229,7 @@ async fn run_scan_impl(app: &AppHandle) -> Result<ScanResult, String> {
             album_name: session.album_name.clone(),
             album_id: session.album_id.clone(),
             local_folder: session.local_folder.clone(),
+            scan_depth: session.scan_depth,
         }
     };
 
@@ -1196,7 +1268,7 @@ async fn run_scan_impl(app: &AppHandle) -> Result<ScanResult, String> {
             }
         };
 
-        let images = images_pending_upload(app, &album_id, &snapshot.local_folder).await?;
+        let images = images_pending_upload(app, &album_id, &snapshot.local_folder, snapshot.scan_depth).await?;
         let total = images.len();
         let mut uploaded = 0;
 
@@ -1244,7 +1316,11 @@ async fn run_scan_impl(app: &AppHandle) -> Result<ScanResult, String> {
 
 // ---------- File watcher + auto scan ----------
 
-fn build_watcher(app: &AppHandle, folder: &str) -> Result<notify::RecommendedWatcher, String> {
+fn build_watcher(
+    app: &AppHandle,
+    folder: &str,
+    depth: u32,
+) -> Result<notify::RecommendedWatcher, String> {
     use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 
     let app = app.clone();
@@ -1268,7 +1344,14 @@ fn build_watcher(app: &AppHandle, folder: &str) -> Result<notify::RecommendedWat
     .map_err(|e| e.to_string())?;
 
     watcher
-        .watch(Path::new(folder), RecursiveMode::NonRecursive)
+        .watch(
+            Path::new(folder),
+            if depth > 0 {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            },
+        )
         .map_err(|e| e.to_string())?;
 
     Ok(watcher)
@@ -1276,33 +1359,37 @@ fn build_watcher(app: &AppHandle, folder: &str) -> Result<notify::RecommendedWat
 
 async fn auto_scan_loop(app: AppHandle) {
     let mut watcher: Option<notify::RecommendedWatcher> = None;
-    let mut watched_folder: Option<String> = None;
+    let mut watched: Option<(String, u32)> = None;
 
     loop {
-        let (folder, frequency) = {
+        let (folder, frequency, depth) = {
             let state = app.state::<Mutex<Session>>();
             let value = match state.lock() {
-                Ok(session) => (session.local_folder.clone(), session.scan_frequency_minutes),
-                Err(_) => (String::new(), 0),
+                Ok(session) => (
+                    session.local_folder.clone(),
+                    session.scan_frequency_minutes,
+                    session.scan_depth,
+                ),
+                Err(_) => (String::new(), 0, 0),
             };
             value
         };
 
-        let folder = if folder.trim().is_empty() {
+        let target = if folder.trim().is_empty() {
             None
         } else {
-            Some(folder)
+            Some((folder, depth))
         };
 
-        if folder != watched_folder {
+        if target != watched {
             watcher.take();
-            watched_folder = folder.clone();
-            if let Some(f) = folder {
-                match build_watcher(&app, &f) {
+            watched = target.clone();
+            if let Some((f, d)) = target {
+                match build_watcher(&app, &f, d) {
                     Ok(w) => watcher = Some(w),
                     Err(e) => {
                         tracing::error!("failed to start file watcher: {}", e);
-                        watched_folder = None;
+                        watched = None;
                     }
                 }
             }
@@ -1345,10 +1432,8 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &scan, &quit])?;
 
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or_else(|| "no default window icon".to_string())?;
+    // Transparent-background logo reads better in panels than the boxed app icon.
+    let icon = tauri::include_image!("icons/tray.png");
 
     TrayIconBuilder::with_id("main-tray")
         .icon(icon)
@@ -1464,6 +1549,7 @@ pub fn run() {
             find_images,
             create_album,
             find_album_by_name,
+            setup_album,
             run_scan,
             pull_album,
             sync_diff,
@@ -1471,4 +1557,33 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_depth_limits_subfolders() {
+        let root = std::env::temp_dir().join(format!("symmich-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join(".hidden")).unwrap();
+        for f in ["top.jpg", "a/one.png", "a/b/two.jpg", ".hidden/skip.jpg", "notes.txt"] {
+            fs::write(root.join(f), b"x").unwrap();
+        }
+        let folder = root.to_str().unwrap();
+        let names = |depth| -> Vec<String> {
+            scan_all_images(folder, depth)
+                .unwrap()
+                .iter()
+                .map(|p| relative_to(folder, p))
+                .collect()
+        };
+
+        assert_eq!(names(0), vec!["top.jpg"]);
+        assert_eq!(names(1), vec!["a/one.png", "top.jpg"]);
+        assert_eq!(names(5), vec!["a/b/two.jpg", "a/one.png", "top.jpg"]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
