@@ -113,8 +113,9 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Each platform's packages keep their bundle folders (deb/, rpm/, dmg/, nsis/...)
       - name: List packages
-        run: ls -la dist
+        run: find dist -type f -exec ls -la {} +
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -122,4 +123,10 @@ jobs:
           name: Symmich ${{ github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: dist/*
+          files: |
+            dist/**/*.deb
+            dist/**/*.rpm
+            dist/**/*.AppImage
+            dist/**/*.dmg
+            dist/**/*.exe
+            dist/**/*.msi
