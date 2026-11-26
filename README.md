@@ -19,8 +19,19 @@ Symmich is an unofficial desktop sync client for Immich.
 ## Installing
 
 Installers for Windows, macOS and Linux (.deb, .rpm, AppImage) are built by
-GitHub Actions whenever a `v*.*.*` tag is pushed, and can be downloaded from
-that workflow run's artifacts.
+GitHub Actions whenever a `v*.*.*` tag is pushed, and published on the
+[Releases](https://github.com/easton57/symmich/releases) page.
+
+## Security
+
+- The server URL must use `https://`, so your password and photos are
+  encrypted on the way. Plain `http://` is only accepted for servers on your
+  home network (private addresses, `localhost`, `.local`/`.lan` names).
+- Your password is kept in the system keychain. Changing the server or account
+  in Settings forgets it and asks you to sign in again, and signing out removes
+  it even when the server can't be reached.
+- Photos pulled from the server are only written inside your sync folder, under
+  plain image file names.
 
 The macOS DMG is not signed or notarized, so Gatekeeper will warn on first
 launch. Right-click the app and choose **Open**, or run

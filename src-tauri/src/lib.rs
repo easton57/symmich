@@ -18,6 +18,78 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 
 const KEYRING_SERVICE: &str = "com.eseidel.symmich";
 
+/// True for hosts that only make sense on a home network, where plain http is
+/// tolerable: localhost, private and link-local addresses, and local names.
+fn is_local_host(host: &reqwest::Url) -> bool {
+    match host.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Some(url::Host::Ipv6(ip)) => {
+            let seg = ip.segments()[0];
+            ip.is_loopback() || (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+        }
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            !name.contains('.')
+                || name == "localhost"
+                || [".local", ".lan", ".home", ".internal", ".home.arpa", ".localhost"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        }
+        None => false,
+    }
+}
+
+/// Checks and normalizes the server URL the password will be sent to. Only
+/// https is allowed on the open internet; plain http is accepted for servers
+/// on the local network only.
+fn normalize_server_url(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("Enter your Immich server URL.".to_string());
+    }
+    let url = reqwest::Url::parse(raw)
+        .map_err(|_| format!("'{}' isn't a valid URL. It should look like https://immich.example.com", raw))?;
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err("The server URL needs a host name, without a user name or password in it.".to_string());
+    }
+    match url.scheme() {
+        "https" => {}
+        "http" if is_local_host(&url) => {}
+        "http" => {
+            return Err("The server URL must start with https:// so your password and photos are encrypted. Plain http:// only works for servers on your home network.".to_string())
+        }
+        _ => return Err("The server URL must start with https://".to_string()),
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Immich asset ids are UUIDs; anything else from the server is refused so it
+/// can never become part of a file name or an unexpected URL path.
+fn valid_asset_id(id: &str) -> bool {
+    id.len() == 36
+        && id.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// A file name from the server that is safe to create inside the sync folder:
+/// a plain image file name with no path parts, hidden-file dot or characters
+/// Windows reserves.
+fn safe_image_file_name(name: &str) -> Option<String> {
+    let base = Path::new(name).file_name()?.to_str()?;
+    let base = base.rsplit(['/', '\\']).next()?.trim();
+    if base.is_empty()
+        || base.starts_with('.')
+        || base.len() > 200
+        || base.chars().any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        || !is_image_path(Path::new(base))
+    {
+        return None;
+    }
+    Some(base.to_string())
+}
+
 fn save_password_to_keyring(email: &str, password: &str) {
     match keyring::Entry::new(KEYRING_SERVICE, email) {
         Ok(entry) => {
@@ -319,13 +391,37 @@ fn get_settings(state: State<'_, Mutex<Session>>) -> Result<Settings, String> {
     Ok(settings_from_session(&session))
 }
 
+#[derive(Serialize, Clone)]
+struct SaveResult {
+    /// The server or account changed, so the saved password was forgotten and
+    /// the user has to sign in again.
+    signed_out: bool,
+}
+
 #[tauri::command]
 fn save_settings(
     app: AppHandle,
     state: State<'_, Mutex<Session>>,
-    settings: Settings,
-) -> Result<(), String> {
+    mut settings: Settings,
+) -> Result<SaveResult, String> {
+    settings.server_url = normalize_server_url(&settings.server_url)?;
+    settings.email = settings.email.trim().to_string();
+
     let mut session = state.lock().map_err(|e| e.to_string())?;
+    // Never send the saved password to a different server or for a different
+    // account: changing either means signing in again.
+    let server_changed = session.server_url.trim_end_matches('/') != settings.server_url;
+    let signed_out = (server_changed || session.email != settings.email) && !session.password.is_empty();
+    if server_changed || session.email != settings.email {
+        delete_password_from_keyring(&session.email);
+        session.password = String::new();
+        session.token = String::new();
+    }
+    if server_changed {
+        // album ids belong to the old server
+        settings.album_id = None;
+    }
+
     session.server_url = settings.server_url.clone();
     session.email = settings.email.clone();
     session.album_name = settings.album_name.clone();
@@ -334,7 +430,8 @@ fn save_settings(
     session.scan_frequency_minutes = settings.scan_frequency_minutes;
     session.scan_depth = settings.scan_depth;
     session.close_behavior = settings.close_behavior.clone();
-    settings.save(&app)
+    settings.save(&app)?;
+    Ok(SaveResult { signed_out })
 }
 
 #[tauri::command]
@@ -355,7 +452,9 @@ fn token_expiry(token: &str) -> Option<i64> {
     let mut parts = token.split('.');
     parts.next()?;
     let payload = parts.next()?;
-    let decoded = BASE64.decode(payload.as_bytes()).ok()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('=').as_bytes())
+        .ok()?;
     let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     value.get("exp").and_then(|e| e.as_i64())
 }
@@ -384,9 +483,10 @@ async fn relogin(app: &AppHandle) -> Result<String, String> {
     if email.is_empty() || password.is_empty() {
         return Err("Not logged in".to_string());
     }
+    let server_url = normalize_server_url(&server_url)?;
 
     let client = reqwest::Client::new();
-    let url = format!("{}/api/auth/login", server_url.trim_end_matches('/'));
+    let url = format!("{}/api/auth/login", server_url);
     let response = client
         .post(&url)
         .json(&serde_json::json!({ "email": email, "password": password }))
@@ -472,8 +572,10 @@ async fn login(
     email: String,
     password: String,
 ) -> Result<serde_json::Value, String> {
+    let url = normalize_server_url(&url)?;
+    let email = email.trim().to_string();
     let client = reqwest::Client::new();
-    let full_url = format!("{}/api/auth/login", url.trim_end_matches('/'));
+    let full_url = format!("{}/api/auth/login", url);
     let payload = serde_json::json!({
         "email": email,
         "password": password
@@ -500,10 +602,19 @@ async fn login(
         .and_then(|t| t.as_str())
         .unwrap_or_default()
         .to_string();
-
-    save_password_to_keyring(&email, &password);
+    if token.is_empty() {
+        return Err("Login returned no token".to_string());
+    }
 
     let mut session = state.lock().map_err(|e| e.to_string())?;
+    if session.server_url.trim_end_matches('/') != url {
+        // album ids belong to the old server
+        session.album_id = None;
+    }
+    if session.email != email {
+        delete_password_from_keyring(&session.email);
+    }
+    save_password_to_keyring(&email, &password);
     session.server_url = url;
     session.email = email;
     session.password = password;
@@ -515,50 +626,31 @@ async fn login(
 
 #[tauri::command]
 async fn logout(app: AppHandle) -> Result<(), String> {
-    let token = valid_token(&app).await?;
-    let client = reqwest::Client::new();
-    let full_url = format!("{}/api/auth/logout", server_url(&app));
+    // Forget the password on this computer first, so signing out works even
+    // when the server can't be reached.
+    let (token, server) = {
+        let state = app.state::<Mutex<Session>>();
+        let mut session = state.lock().map_err(|e| e.to_string())?;
+        delete_password_from_keyring(&session.email);
+        session.password = String::new();
+        (std::mem::take(&mut session.token), session.server_url.clone())
+    };
 
-    let response = client
-        .post(&full_url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("Logout failed with status {}", status));
+    // Then end the session on the server too, if there is one to end.
+    if !token.is_empty() {
+        if let Ok(server) = normalize_server_url(&server) {
+            let _ = reqwest::Client::new()
+                .post(format!("{}/api/auth/logout", server))
+                .bearer_auth(token)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+        }
     }
-
-    let state = app.state::<Mutex<Session>>();
-    let mut session = state.lock().map_err(|e| e.to_string())?;
-    delete_password_from_keyring(&session.email);
-    session.token = String::new();
-    session.password = String::new();
-
     Ok(())
 }
 
 // ---------- File scanning ----------
-
-#[tauri::command]
-fn list_files_in_directory(path: &str) -> Result<Vec<String>, String> {
-    let mut file_list = Vec::new();
-    let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                file_list.push(file_name.to_string());
-            }
-        }
-    }
-
-    Ok(file_list)
-}
 
 fn is_image_path(path: &Path) -> bool {
     path.extension()
@@ -650,6 +742,9 @@ async fn fetch_album_assets(
     match search_album_assets(app, album_id).await {
         Ok(assets) => Ok(assets),
         Err(search_err) => {
+            if !valid_asset_id(album_id) {
+                return Err(search_err);
+            }
             let (status, parsed) = api_json_request(
                 app,
                 reqwest::Method::GET,
@@ -968,7 +1063,10 @@ async fn upload_image(app: &AppHandle, album_id: &str, image_path: &str) -> Resu
 fn ext_from_asset(asset: &serde_json::Value) -> String {
     if let Some(name) = asset.get("originalFileName").and_then(|n| n.as_str()) {
         if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
-            return format!(".{}", ext.to_lowercase());
+            let ext = ext.to_lowercase();
+            if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+                return format!(".{}", ext);
+            }
         }
     }
     match asset.get("mimeType").and_then(|m| m.as_str()) {
@@ -981,42 +1079,54 @@ fn ext_from_asset(asset: &serde_json::Value) -> String {
     }
 }
 
-async fn download_asset(app: &AppHandle, asset_id: &str) -> Result<Vec<u8>, String> {
-    let token = valid_token(app).await?;
+/// Streams an asset's original into `target`. The download goes to a hidden
+/// temp file first so an interrupted transfer never leaves a half-written
+/// photo, and a symlink at `target` is replaced rather than written through.
+async fn download_asset_to(app: &AppHandle, asset_id: &str, target: &Path) -> Result<(), String> {
+    use std::io::Write;
+
+    if !valid_asset_id(asset_id) {
+        return Err(format!("Refusing asset with an unexpected id '{}'", asset_id));
+    }
     let client = reqwest::Client::new();
     let url = format!("{}/api/assets/{}/original", server_url(app), asset_id);
 
-    let response = client
-        .get(&url)
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let status = response.status();
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        let token = relogin(app).await?;
-        let response = client
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        if !status.is_success() {
-            return Err(format!("Download failed with status {}", status));
+    let mut response = None;
+    for _ in 0..2 {
+        let token = valid_token(app).await?;
+        let r = client.get(&url).bearer_auth(&token).send().await.map_err(|e| e.to_string())?;
+        if r.status() == reqwest::StatusCode::UNAUTHORIZED {
+            relogin(app).await?;
+            continue;
         }
-        return Ok(bytes.to_vec());
+        response = Some(r);
+        break;
+    }
+    let mut response = response.ok_or_else(|| "Unauthorized".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Download failed with status {}", response.status()));
     }
 
-    if !status.is_success() {
-        return Err(format!("Download failed with status {}", status));
+    let dir = target.parent().ok_or_else(|| "Invalid download path".to_string())?;
+    let tmp = dir.join(format!(".symmich-{}.part", asset_id));
+    let result = async {
+        let mut file = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            file.write_all(&chunk).map_err(|e| e.to_string())?;
+        }
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        // replace what's there (Windows can't rename over an existing file)
+        if fs::symlink_metadata(target).is_ok() {
+            fs::remove_file(target).map_err(|e| e.to_string())?;
+        }
+        fs::rename(&tmp, target).map_err(|e| e.to_string())
     }
-
-    Ok(bytes.to_vec())
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[tauri::command]
@@ -1051,28 +1161,32 @@ async fn pull_album(app: AppHandle) -> Result<PullResult, String> {
         let asset_id = asset.get("id").and_then(|i| i.as_str()).unwrap_or("");
         let checksum = asset_checksum_hex(asset);
         let present = checksum.as_ref().is_some_and(|c| local_checksums.contains(c));
-        if asset_id.is_empty() || manifest.contains_asset(asset_id) || present {
+        // Only well-formed ids are trusted: the id can end up in the file name.
+        if !valid_asset_id(asset_id) || manifest.contains_asset(asset_id) || present {
             skipped += 1;
             continue;
         }
 
-        let original_name = asset
+        // The server's file name is used only if it is a plain image file name;
+        // otherwise the file is named after its id.
+        let file_name = asset
             .get("originalFileName")
             .and_then(|n| n.as_str())
-            .and_then(|n| Path::new(n).file_name())
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_string());
-        let file_name = original_name.unwrap_or_else(|| format!("{}{}", asset_id, ext_from_asset(asset)));
+            .and_then(safe_image_file_name)
+            .unwrap_or_else(|| format!("{}{}", asset_id, ext_from_asset(asset)));
+        if safe_image_file_name(&file_name).is_none() {
+            skipped += 1;
+            continue;
+        }
         let target = Path::new(&local_folder).join(&file_name);
-        // A different file with the same name is a conflict; leave it for
-        // conflict resolution rather than overwriting it.
-        if target.exists() {
+        // A different file with the same name (or a link there) is a conflict;
+        // leave it for conflict resolution rather than overwriting it.
+        if fs::symlink_metadata(&target).is_ok() {
             skipped += 1;
             continue;
         }
 
-        let bytes = download_asset(&app, asset_id).await?;
-        fs::write(&target, bytes).map_err(|e| e.to_string())?;
+        download_asset_to(&app, asset_id, &target).await?;
         if let Some(c) = checksum {
             local_checksums.insert(c);
         }
@@ -1234,7 +1348,8 @@ async fn resolve_conflict(
     let asset_id = asset
         .get("id")
         .and_then(|i| i.as_str())
-        .ok_or_else(|| "Missing asset id".to_string())?;
+        .filter(|id| valid_asset_id(id))
+        .ok_or_else(|| "Missing or invalid asset id".to_string())?;
 
     let local_folder = {
         let state = app.state::<Mutex<Session>>();
@@ -1243,8 +1358,19 @@ async fn resolve_conflict(
     };
 
     if keep == "remote" {
-        let bytes = download_asset(&app, asset_id).await?;
-        fs::write(Path::new(&local_folder).join(&file), bytes).map_err(|e| e.to_string())?;
+        if local_folder.trim().is_empty() {
+            return Err("No local folder set. Add one in Settings.".to_string());
+        }
+        let target = Path::new(&local_folder).join(&file);
+        // Don't follow a link out of the sync folder: the parent folders must
+        // be real folders inside it.
+        let root = fs::canonicalize(&local_folder).map_err(|e| e.to_string())?;
+        let parent = target.parent().ok_or_else(|| "Invalid file path".to_string())?;
+        let real_parent = fs::canonicalize(parent).map_err(|e| e.to_string())?;
+        if !real_parent.starts_with(&root) {
+            return Err(format!("'{}' is outside the sync folder", file));
+        }
+        download_asset_to(&app, asset_id, &target).await?;
         Ok(ResolveResult {
             action: "remote".to_string(),
             file,
@@ -1616,7 +1742,6 @@ pub fn run() {
             get_settings,
             save_settings,
             get_scan_status,
-            list_files_in_directory,
             find_images,
             create_album,
             find_album_by_name,
@@ -1656,5 +1781,47 @@ mod tests {
         assert_eq!(names(5), vec!["a/b/two.jpg", "a/one.png", "top.jpg"]);
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn server_url_must_be_https_off_the_home_network() {
+        assert_eq!(normalize_server_url("https://immich.example.com/").unwrap(), "https://immich.example.com");
+        assert_eq!(normalize_server_url(" https://photos.example.com/immich ").unwrap(), "https://photos.example.com/immich");
+        assert!(normalize_server_url("http://immich.example.com").is_err());
+        assert!(normalize_server_url("immich.example.com").is_err());
+        assert!(normalize_server_url("ftp://immich.example.com").is_err());
+        assert!(normalize_server_url("https://user:pw@immich.example.com").is_err());
+        assert!(normalize_server_url("").is_err());
+        for local in [
+            "http://192.168.1.20:2283",
+            "http://10.0.0.5:2283",
+            "http://localhost:2283",
+            "http://127.0.0.1:2283",
+            "http://immich.local:2283",
+            "http://nas:2283",
+            "http://[fd00::5]:2283",
+        ] {
+            assert!(normalize_server_url(local).is_ok(), "{} should be allowed", local);
+        }
+        assert!(normalize_server_url("http://8.8.8.8:2283").is_err());
+    }
+
+    #[test]
+    fn server_ids_and_names_cannot_escape_the_sync_folder() {
+        assert!(valid_asset_id("3f2b8c1e-9a4d-4e7b-8c2a-1d5e6f7a8b9c"));
+        assert!(!valid_asset_id("../../etc/passwd"));
+        assert!(!valid_asset_id("3f2b8c1e-9a4d-4e7b-8c2a-1d5e6f7a8b9/"));
+        assert!(!valid_asset_id(""));
+
+        assert_eq!(safe_image_file_name("IMG_0001.JPG").as_deref(), Some("IMG_0001.JPG"));
+        assert_eq!(safe_image_file_name("../../evil.jpg").as_deref(), Some("evil.jpg"));
+        assert_eq!(safe_image_file_name("..\\..\\evil.jpg").as_deref(), Some("evil.jpg"));
+        assert_eq!(safe_image_file_name("dir/photo.png").as_deref(), Some("photo.png"));
+        assert!(safe_image_file_name("run.desktop").is_none());
+        assert!(safe_image_file_name("script.bat").is_none());
+        assert!(safe_image_file_name(".bashrc").is_none());
+        assert!(safe_image_file_name("..").is_none());
+        assert!(safe_image_file_name("photo.jpg:stream").is_none());
+        assert!(safe_image_file_name("a\u{0}b.jpg").is_none());
     }
 }
