@@ -229,7 +229,7 @@ function App() {
 
   async function handleSaveSettings() {
     try {
-      await invoke("save_settings", {
+      const result = await invoke<{ signed_out: boolean }>("save_settings", {
         settings: {
           server_url: serverUrl,
           email,
@@ -241,6 +241,13 @@ function App() {
           close_behavior: closeBehavior,
         },
       });
+      if (result.signed_out) {
+        // A different server or account: the saved password was forgotten.
+        setLoggedIn(false);
+        setAlbumId("");
+        notice("Settings saved. Your server or account changed, so please sign in again.");
+        return;
+      }
       notice("Settings saved");
       refreshActivity();
     } catch (err) {
