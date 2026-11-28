@@ -10,6 +10,8 @@ Symmich is an unofficial desktop sync client for Immich.
 - [x] Conflict Resolution
 - [x] Folder to Remote Album (Local folder creates an album in immich)
 - [x] Simple UI to sign in, resolve conflicts, and check sync status
+- [x] Remembers your password so it signs in by itself
+- [x] Optional start at login, quietly in the tray
 
 ## Libraries
 
@@ -27,7 +29,9 @@ GitHub Actions whenever a `v*.*.*` tag is pushed, and published on the
 - The server URL must use `https://`, so your password and photos are
   encrypted on the way. Plain `http://` is only accepted for servers on your
   home network (private addresses, `localhost`, `.local`/`.lan` names).
-- Your password is kept in the system keychain. Changing the server or account
+- If "Remember my password" is on, your password is kept in the system's
+  password store (Windows Credential Manager, macOS Keychain, or the Secret
+  Service on Linux), never in a plain file. Changing the server or account
   in Settings forgets it and asks you to sign in again, and signing out removes
   it even when the server can't be reached.
 - Photos pulled from the server are only written inside your sync folder, under

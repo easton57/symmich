@@ -90,15 +90,15 @@ fn safe_image_file_name(name: &str) -> Option<String> {
     Some(base.to_string())
 }
 
-fn save_password_to_keyring(email: &str, password: &str) {
-    match keyring::Entry::new(KEYRING_SERVICE, email) {
-        Ok(entry) => {
-            if let Err(e) = entry.set_password(password) {
-                tracing::warn!("failed to save credentials to keyring: {}", e);
-            }
-        }
-        Err(e) => tracing::warn!("failed to access keyring: {}", e),
-    }
+/// Saves the password in the system's password store (Windows Credential
+/// Manager, macOS Keychain, or the Secret Service on Linux).
+fn save_password_to_keyring(email: &str, password: &str) -> Result<(), String> {
+    keyring::Entry::new(KEYRING_SERVICE, email)
+        .and_then(|entry| entry.set_password(password))
+        .map_err(|e| {
+            tracing::warn!("failed to save credentials to keyring: {}", e);
+            e.to_string()
+        })
 }
 
 fn load_password_from_keyring(email: &str) -> Option<String> {
@@ -120,6 +120,13 @@ fn delete_password_from_keyring(email: &str) {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Passed by the login item so Symmich starts quietly in the tray.
+const AUTOSTART_ARG: &str = "--minimized";
+
 fn default_close_behavior() -> String {
     "hide".to_string()
 }
@@ -137,6 +144,10 @@ struct Settings {
     scan_depth: u32,
     #[serde(default = "default_close_behavior")]
     close_behavior: String,
+    /// Keep the password in the system's password store so Symmich signs in
+    /// by itself next time.
+    #[serde(default = "default_true")]
+    remember_password: bool,
 }
 
 impl Default for Settings {
@@ -150,6 +161,7 @@ impl Default for Settings {
             scan_frequency_minutes: 30,
             scan_depth: 0,
             close_behavior: default_close_behavior(),
+            remember_password: true,
         }
     }
 }
@@ -285,6 +297,7 @@ struct Session {
     scan_frequency_minutes: u64,
     scan_depth: u32,
     close_behavior: String,
+    remember_password: bool,
     scan_running: bool,
     last_scan: Option<String>,
     last_scan_count: usize,
@@ -305,6 +318,7 @@ impl Default for Session {
             scan_frequency_minutes: 30,
             scan_depth: 0,
             close_behavior: default_close_behavior(),
+            remember_password: true,
             scan_running: false,
             last_scan: None,
             last_scan_count: 0,
@@ -317,7 +331,11 @@ impl Default for Session {
 impl Session {
     fn load(app: &AppHandle) -> Self {
         let settings = Settings::load(app);
-        let password = load_password_from_keyring(&settings.email).unwrap_or_default();
+        let password = if settings.remember_password {
+            load_password_from_keyring(&settings.email).unwrap_or_default()
+        } else {
+            String::new()
+        };
         Self {
             server_url: settings.server_url,
             email: settings.email,
@@ -329,6 +347,7 @@ impl Session {
             scan_frequency_minutes: settings.scan_frequency_minutes,
             scan_depth: settings.scan_depth,
             close_behavior: settings.close_behavior,
+            remember_password: settings.remember_password,
             scan_running: false,
             last_scan: None,
             last_scan_count: 0,
@@ -352,6 +371,7 @@ fn settings_from_session(session: &Session) -> Settings {
         scan_frequency_minutes: session.scan_frequency_minutes,
         scan_depth: session.scan_depth,
         close_behavior: session.close_behavior.clone(),
+        remember_password: session.remember_password,
     }
 }
 
@@ -430,6 +450,15 @@ fn save_settings(
     session.scan_frequency_minutes = settings.scan_frequency_minutes;
     session.scan_depth = settings.scan_depth;
     session.close_behavior = settings.close_behavior.clone();
+    if session.remember_password != settings.remember_password && !session.password.is_empty() {
+        if settings.remember_password {
+            save_password_to_keyring(&session.email, &session.password)?;
+        } else {
+            // Stays signed in until Symmich quits, then asks again.
+            delete_password_from_keyring(&session.email);
+        }
+    }
+    session.remember_password = settings.remember_password;
     settings.save(&app)?;
     Ok(SaveResult { signed_out })
 }
@@ -571,7 +600,9 @@ async fn login(
     url: String,
     email: String,
     password: String,
+    remember: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let remember = remember.unwrap_or(true);
     let url = normalize_server_url(&url)?;
     let email = email.trim().to_string();
     let client = reqwest::Client::new();
@@ -611,10 +642,23 @@ async fn login(
         // album ids belong to the old server
         session.album_id = None;
     }
-    if session.email != email {
+    if session.email != email || !remember {
         delete_password_from_keyring(&session.email);
     }
-    save_password_to_keyring(&email, &password);
+    let mut parsed = parsed;
+    if remember {
+        // Signing in still works if the password store is unavailable; the
+        // app just has to ask again next time, so tell the user why.
+        if let Err(e) = save_password_to_keyring(&email, &password) {
+            if let Some(obj) = parsed.as_object_mut() {
+                obj.insert(
+                    "symmichWarning".into(),
+                    format!("Signed in, but your password couldn't be saved on this computer: {}", e).into(),
+                );
+            }
+        }
+    }
+    session.remember_password = remember;
     session.server_url = url;
     session.email = email;
     session.password = password;
@@ -1605,6 +1649,81 @@ async fn auto_scan_loop(app: AppHandle) {
     }
 }
 
+// ---------- Start at login ----------
+
+#[tauri::command]
+fn get_autostart(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let launcher = app.autolaunch();
+    let result = if enabled { launcher.enable() } else { launcher.disable() };
+    result.map_err(|e| format!("Couldn't change the start-up setting: {}", e))
+}
+
+/// Builds the main window from tauri.conf.json. It's created on demand rather
+/// than at startup so the quiet launch at login can wait in the tray: on Linux
+/// a window that was created hidden can't be shown again later.
+fn create_main_window(app: &AppHandle, visible: bool) -> tauri::Result<()> {
+    let Some(config) = app.config().app.windows.first().cloned() else {
+        return Ok(());
+    };
+    let window = tauri::WebviewWindowBuilder::from_config(app, &config)?
+        .visible(visible)
+        .build()?;
+    let app_handle = app.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+
+            let close_behavior = {
+                let state = app_handle.state::<Mutex<Session>>();
+                state
+                    .lock()
+                    .map(|s| s.close_behavior.clone())
+                    .unwrap_or_else(|_| default_close_behavior())
+            };
+
+            if close_behavior == "quit_confirm" {
+                let exit_handle = app_handle.clone();
+                app_handle
+                    .dialog()
+                    .message("Are you sure you want to quit Symmich?")
+                    .title("Quit Symmich")
+                    .kind(MessageDialogKind::Warning)
+                    .buttons(MessageDialogButtons::OkCancel)
+                    .show(move |confirmed| {
+                        if confirmed {
+                            exit_handle.exit(0);
+                        }
+                    });
+            } else if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.hide();
+            }
+        }
+    });
+    Ok(())
+}
+
+fn show_main_window(app: &AppHandle) {
+    match app.get_webview_window("main") {
+        Some(window) => {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+        None => {
+            if let Err(e) = create_main_window(app, true) {
+                tracing::error!("failed to open the window: {}", e);
+            }
+        }
+    }
+}
+
 // ---------- Tray icon ----------
 
 /// GTK's native tray/menu widgets don't reliably follow the desktop's dark-mode
@@ -1639,12 +1758,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
             match event.id.as_ref() {
-                "show" => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
-                }
+                "show" => show_main_window(app),
                 "scan" => {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
@@ -1662,11 +1776,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } = event
             {
-                let app = tray.app_handle();
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -1679,9 +1789,19 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .args([AUTOSTART_ARG])
+                .build(),
+        )
         .setup(|app| {
             let session = Session::load(app.handle());
             app.manage(Mutex::new(session));
+
+            // The quiet launch at login waits in the tray without a window.
+            if !std::env::args().any(|a| a == AUTOSTART_ARG) {
+                create_main_window(app.handle(), true)?;
+            }
 
             let prefers_dark = app
                 .get_webview_window("main")
@@ -1692,40 +1812,6 @@ pub fn run() {
 
             if let Err(e) = setup_tray(app) {
                 tracing::error!("failed to create tray icon: {}", e);
-            }
-
-            if let Some(window) = app.get_webview_window("main") {
-                let app_handle = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-
-                        let close_behavior = {
-                            let state = app_handle.state::<Mutex<Session>>();
-                            state
-                                .lock()
-                                .map(|s| s.close_behavior.clone())
-                                .unwrap_or_else(|_| default_close_behavior())
-                        };
-
-                        if close_behavior == "quit_confirm" {
-                            let exit_handle = app_handle.clone();
-                            app_handle
-                                .dialog()
-                                .message("Are you sure you want to quit Symmich?")
-                                .title("Quit Symmich")
-                                .kind(MessageDialogKind::Warning)
-                                .buttons(MessageDialogButtons::OkCancel)
-                                .show(move |confirmed| {
-                                    if confirmed {
-                                        exit_handle.exit(0);
-                                    }
-                                });
-                        } else if let Some(window) = app_handle.get_webview_window("main") {
-                            let _ = window.hide();
-                        }
-                    }
-                });
             }
 
             let app_handle = app.handle().clone();
@@ -1741,6 +1827,8 @@ pub fn run() {
             get_session,
             get_settings,
             save_settings,
+            get_autostart,
+            set_autostart,
             get_scan_status,
             find_images,
             create_album,

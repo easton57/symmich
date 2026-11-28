@@ -497,6 +497,26 @@ a:hover {
   color: var(--text-muted);
 }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  text-align: left;
+  font-size: 0.88rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.check-row input[type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  padding: 0;
+  flex: none;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
 .row {
   display: flex;
   justify-content: flex-start;
