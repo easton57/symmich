@@ -39,6 +39,7 @@ interface Settings {
   scan_frequency_minutes: number;
   scan_depth: number;
   close_behavior: CloseBehavior;
+  remember_password: boolean;
 }
 
 interface ScanStatus {
@@ -103,6 +104,8 @@ function App() {
   const [scanFrequency, setScanFrequency] = useState("30");
   const [scanDepth, setScanDepth] = useState("0");
   const [closeBehavior, setCloseBehavior] = useState<CloseBehavior>("hide");
+  const [rememberPassword, setRememberPassword] = useState(true);
+  const [autostart, setAutostart] = useState(false);
   const [images, setImages] = useState<string[] | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -134,7 +137,12 @@ function App() {
         setScanFrequency(String(s.scan_frequency_minutes ?? 0));
         setScanDepth(String(s.scan_depth ?? 0));
         setCloseBehavior(s.close_behavior ?? "hide");
+        setRememberPassword(s.remember_password ?? true);
       })
+      .catch(() => {});
+
+    invoke<boolean>("get_autostart")
+      .then(setAutostart)
       .catch(() => {});
 
     invoke<ScanStatus>("get_scan_status")
@@ -196,7 +204,12 @@ function App() {
     e.preventDefault();
     setError("");
     try {
-      await invoke("login", { url: serverUrl, email, password });
+      const result = await invoke<{ symmichWarning?: string }>("login", {
+        url: serverUrl,
+        email,
+        password,
+        remember: rememberPassword,
+      });
       setPassword("");
       setLoggedIn(true);
       if (!albumId) {
@@ -211,6 +224,7 @@ function App() {
       } else {
         notice("Logged in");
       }
+      if (result?.symmichWarning) fail(result.symmichWarning);
       refreshActivity();
     } catch (err) {
       fail(err);
@@ -239,8 +253,10 @@ function App() {
           scan_frequency_minutes: Number(scanFrequency) || 0,
           scan_depth: Math.max(0, Math.floor(Number(scanDepth) || 0)),
           close_behavior: closeBehavior,
+          remember_password: rememberPassword,
         },
       });
+      await invoke("set_autostart", { enabled: autostart });
       if (result.signed_out) {
         // A different server or account: the saved password was forgotten.
         setLoggedIn(false);
@@ -394,6 +410,14 @@ function App() {
                 type="password"
               />
             </div>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={rememberPassword}
+                onChange={(e) => setRememberPassword(e.currentTarget.checked)}
+              />
+              Remember my password
+            </label>
             {!albumId && (
               <div className="input-icon">
                 <ImageIcon size={16} />
@@ -666,6 +690,14 @@ function App() {
                 placeholder="Email"
                 type="email"
               />
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={rememberPassword}
+                  onChange={(e) => setRememberPassword(e.currentTarget.checked)}
+                />
+                Remember my password on this computer
+              </label>
 
               <span className="field-group-label">Sync</span>
               <input
@@ -714,6 +746,14 @@ function App() {
                   <option value="hide">Hide to tray</option>
                   <option value="quit_confirm">Ask before quitting</option>
                 </select>
+              </label>
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={autostart}
+                  onChange={(e) => setAutostart(e.currentTarget.checked)}
+                />
+                Start Symmich when I log in to this computer (it waits in the tray)
               </label>
 
               <button className="btn btn-primary" onClick={handleSaveSettings}>
